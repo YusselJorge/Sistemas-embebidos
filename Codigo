@@ -1,0 +1,173 @@
+// Funciona con un giroscopio y de forma automatica
+
+
+#include <Wire.h>
+#include <PID_v1.h>
+
+const int pinPWM = 9;
+#define MPU6050_address 0x68
+
+// --- Variables MPU6050 ---
+float gyro_Z, gyro_X, gyro_Y, temperature, gyro_X_cal, gyro_Y_cal, gyro_Z_cal;
+int gx, gy, gz, cal_int;
+float acc_total_vector, ax, ay, az;
+bool set_gyro_angles = false, accCalibOK = false;
+float acc_X_cal, acc_Y_cal, acc_Z_cal, angulo_pitch_acc, angulo_roll_acc, angulo_pitch, angulo_roll;
+long tiempo_ejecucion, loop_timer;
+
+// --- PID ---
+double setpoint = 0.0;
+double input = 0.0;
+double output = 1000.0;
+double Kp = 1.321, Ki = 1.065, Kd = 0.386;
+PID myPID(&input, &output, &setpoint, Kp, Ki, Kd, DIRECT);
+
+int prevOutput = 1000;
+const int RAMP_STEP = 5; // suavidad PWM
+const double setpointFinal = 40.0;
+const double incrementoSetpoint = 0.12; // sube lento (ajusta aquí para más rápido/lento)
+
+void setup() {
+  pinMode(pinPWM, OUTPUT);
+  Serial.begin(9600);
+  Wire.begin();
+
+  // Calibrar MPU6050
+  MPU6050_iniciar();
+  Serial.println("Calibrando sensor, NO mover...");
+  gyro_X_cal = gyro_Y_cal = gyro_Z_cal = 0;
+  acc_X_cal = acc_Y_cal = acc_Z_cal = 0;
+  for (cal_int = 0; cal_int < 3000; cal_int++) {
+    MPU6050_leer();
+    gyro_X_cal += gx;
+    gyro_Y_cal += gy;
+    gyro_Z_cal += gz;
+    acc_X_cal  += ax;
+    acc_Y_cal  += ay;
+    acc_Z_cal  += az;
+    delayMicroseconds(50);
+  }
+  gyro_X_cal /= 3000.0;
+  gyro_Y_cal /= 3000.0;
+  gyro_Z_cal /= 3000.0;
+  acc_X_cal  /= 3000.0;
+  acc_Y_cal  /= 3000.0;
+  acc_Z_cal  /= 3000.0;
+  accCalibOK = true;
+  Serial.println("Sensor calibrado.");
+  delay(500);
+
+  loop_timer = micros();
+
+  // Armar el ESC
+  Serial.println("Armando ESC...");
+  for (int i = 0; i < 100; i++) {
+    digitalWrite(pinPWM, HIGH);
+    delayMicroseconds(1000);
+    digitalWrite(pinPWM, LOW);
+    delayMicroseconds(20000 - 1000);
+    delay(1);
+  }
+
+  // Leer ángulo inicial y arrancar setpoint en ese valor
+  MPU6050_leer();
+  MPU6050_procesar();
+  input = angulo_pitch;
+  setpoint = input;
+  output = 1000;
+  prevOutput = 1000;
+
+  myPID.SetOutputLimits(1000, 2000);
+  myPID.SetMode(AUTOMATIC);
+
+  Serial.print("Ángulo inicial (pitch): ");
+  Serial.print(input, 2);
+  Serial.println("°");
+  Serial.println(">> Subida suave y mantenimiento en 45°.");
+}
+
+void loop() {
+  while (micros() - loop_timer < 5000);
+  tiempo_ejecucion = (micros() - loop_timer) / 1000;
+  loop_timer = micros();
+
+  // Leer y procesar sensor
+  MPU6050_leer();
+  MPU6050_procesar();
+  input = angulo_pitch;
+
+  // Ramp-up suave del setpoint hasta 45°
+  if (setpoint < setpointFinal) {
+    setpoint += incrementoSetpoint;
+    if (setpoint > setpointFinal) setpoint = setpointFinal;
+  }
+
+  myPID.Compute();
+
+  // Suaviza el cambio de pulso (Ramp-up/down)
+  int rampedOutput = prevOutput;
+  if (output > prevOutput + RAMP_STEP)
+    rampedOutput = prevOutput + RAMP_STEP;
+  else if (output < prevOutput - RAMP_STEP)
+    rampedOutput = prevOutput - RAMP_STEP;
+  else
+    rampedOutput = output;
+  prevOutput = rampedOutput;
+
+  if (rampedOutput < 1000) rampedOutput = 1000;
+  if (rampedOutput > 2000) rampedOutput = 2000;
+
+  digitalWrite(pinPWM, HIGH);
+  delayMicroseconds(rampedOutput);
+  digitalWrite(pinPWM, LOW);
+  delayMicroseconds(20000 - rampedOutput);
+
+  Serial.print("Pitch: "); Serial.print(angulo_pitch, 2);
+  Serial.print("° | Objetivo: "); Serial.print(setpoint, 2);
+  Serial.print("° | Pulso: "); Serial.println(rampedOutput);
+}
+
+// --- FUNCIONES MPU6050 ---
+void MPU6050_iniciar() {
+  Wire.beginTransmission(MPU6050_address);
+  Wire.write(0x6B); Wire.write(0x00); Wire.endTransmission();
+  Wire.beginTransmission(MPU6050_address);
+  Wire.write(0x1B); Wire.write(0x08); Wire.endTransmission();
+  Wire.beginTransmission(MPU6050_address);
+  Wire.write(0x1C); Wire.write(0x10); Wire.endTransmission();
+}
+void MPU6050_leer() {
+  Wire.beginTransmission(MPU6050_address);
+  Wire.write(0x3B);
+  Wire.endTransmission();
+  Wire.requestFrom(MPU6050_address, 14);
+  while (Wire.available() < 14);
+  ax = Wire.read() << 8 | Wire.read();
+  ay = Wire.read() << 8 | Wire.read();
+  az = Wire.read() << 8 | Wire.read();
+  temperature = Wire.read() << 8 | Wire.read();
+  gx = Wire.read() << 8 | Wire.read();
+  gy = Wire.read() << 8 | Wire.read();
+  gz = Wire.read() << 8 | Wire.read();
+}
+void MPU6050_procesar() {
+  ax -= acc_X_cal; ay -= acc_Y_cal; az -= acc_Z_cal; az = az + 4096;
+  gyro_X = (gx - gyro_X_cal) / 65.5;
+  gyro_Y = (gy - gyro_Y_cal) / 65.5;
+  gyro_Z = (gz - gyro_Z_cal) / 65.5;
+  angulo_pitch += gyro_X * tiempo_ejecucion / 1000;
+  angulo_roll  += gyro_Y * tiempo_ejecucion / 1000;
+  angulo_pitch += angulo_roll  * sin((gz - gyro_Z_cal) * tiempo_ejecucion  * 0.000000266);
+  angulo_roll  -= angulo_pitch * sin((gz - gyro_Z_cal) * tiempo_ejecucion  * 0.000000266);
+  acc_total_vector  = sqrt(pow(ay, 2) + pow(ax, 2) + pow(az, 2));
+  angulo_pitch_acc  = asin((float)ay / acc_total_vector) * 57.2958;
+  angulo_roll_acc   = asin((float)ax / acc_total_vector) * -57.2958;
+  if (set_gyro_angles) {
+    angulo_pitch = angulo_pitch * 0.99 + angulo_pitch_acc * 0.01;
+    angulo_roll  = angulo_roll  * 0.99 + angulo_roll_acc  * 0.01;
+  } else {
+    angulo_pitch = angulo_pitch_acc;
+    angulo_roll  = angulo_roll_acc;
+    set_gyro_angles = true;
+  }
+}
